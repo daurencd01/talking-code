@@ -40,6 +40,7 @@ export default function ARPage() {
         width: number;
         height: number;
     } | null>(null);
+    const [activated, setActivated] = useState(false);
 
     const [isPortrait, setIsPortrait] = useState(true);
     const [cameraError, setCameraError] = useState<string | null>(null);
@@ -194,13 +195,11 @@ export default function ARPage() {
                         height: screenH
                     });
 
-                    // Ensure video is playing
-                    if (videoRef.current && videoRef.current.paused) {
-                        videoRef.current.play().catch(e => console.log("Play error", e));
-                    }
+                    // Autoplay REMOVED. Activation is manual now.
                 } else {
                     // Lost tracking
                     setQrAnchor(null);
+                    setActivated(false); // Reset activation state
                     if (videoRef.current) {
                         videoRef.current.pause();
                         videoRef.current.currentTime = 0;
@@ -286,6 +285,18 @@ export default function ARPage() {
         }
     };
 
+    const handleActivate = (e: React.MouseEvent | React.TouchEvent) => {
+        e.stopPropagation();
+        setActivated(true);
+    };
+
+    // Trigger play when activated
+    useEffect(() => {
+        if (activated && videoRef.current) {
+            videoRef.current.play().catch(e => console.log("Play error", e));
+        }
+    }, [activated]);
+
     // --- Renders ---
 
     if (cameraError) {
@@ -353,39 +364,52 @@ export default function ARPage() {
                             height: `${qrAnchor.height}px`,
                         }}
                     >
-                        {/* Hologram Visuals Wrapper */}
-                        {/* We shift it UP (-100%) so it sits ON TOP of the QR box */}
-                        <div
-                            className="absolute bottom-full left-1/2 -translate-x-1/2 w-[180%] h-[150%] flex flex-col items-center justify-end"
-                            style={{ marginBottom: '10px' }}
-                        >
-                            {/* Materialization Container */}
-                            <div className="relative w-full h-full hologram-materialize origin-bottom">
+                        {/* 1. ACTIVATED: Show Hologram */}
+                        {activated && (
+                            <div
+                                className="absolute bottom-full left-1/2 -translate-x-1/2 w-[180%] h-[150%] flex flex-col items-center justify-end"
+                                style={{ marginBottom: '10px' }}
+                            >
+                                {/* Materialization Container */}
+                                <div className="relative w-full h-full hologram-materialize origin-bottom">
 
-                                {/* Glow/Scanlines */}
-                                <div className="absolute inset-0 scanlines z-20 rounded-lg opacity-60" />
-                                <div className="absolute inset-0 bg-cyan-500/10 z-10 blur-xl rounded-full opacity-30" />
+                                    {/* Glow/Scanlines */}
+                                    <div className="absolute inset-0 scanlines z-20 rounded-lg opacity-60" />
+                                    <div className="absolute inset-0 bg-cyan-500/10 z-10 blur-xl rounded-full opacity-30" />
 
-                                <video
-                                    ref={videoRef}
-                                    src={videoSrc}
-                                    playsInline
-                                    loop
-                                    muted
-                                    className="w-full h-full object-contain filter drop-shadow-[0_0_15px_rgba(0,190,255,0.5)]"
-                                    style={{
-                                        maskImage: 'linear-gradient(to bottom, black 85%, transparent 100%)',
-                                        WebkitMaskImage: 'linear-gradient(to bottom, black 85%, transparent 100%)'
-                                    }}
-                                />
+                                    <video
+                                        ref={videoRef}
+                                        src={videoSrc}
+                                        autoPlay
+                                        playsInline
+                                        loop
+                                        muted
+                                        className="w-full h-full object-contain filter drop-shadow-[0_0_15px_rgba(0,190,255,0.5)]"
+                                        style={{
+                                            maskImage: 'linear-gradient(to bottom, black 85%, transparent 100%)',
+                                            WebkitMaskImage: 'linear-gradient(to bottom, black 85%, transparent 100%)'
+                                        }}
+                                    />
+                                </div>
                             </div>
-                        </div>
+                        )}
+
+                        {/* 2. PRE-ACTIVATION: Tap Button */}
+                        {!activated && (
+                            <div className="absolute bottom-full mb-4 left-1/2 -translate-x-1/2 min-w-[150px] flex justify-center">
+                                <button
+                                    onClick={handleActivate}
+                                    className="bg-cyan-500 text-black font-bold py-2 px-6 rounded-full shadow-[0_0_20px_rgba(34,211,238,0.6)] animate-bounce pointer-events-auto"
+                                >
+                                    TAP TO ACTIVATE
+                                </button>
+                            </div>
+                        )}
 
                         {/* Tracking Confirmation (The green box around QR) */}
                         <div className="absolute inset-0 border-2 border-cyan-400/50 rounded-lg animate-pulse bg-cyan-400/10 box-confirm" />
                     </div>
                 )}
-
             </div>
 
             <style jsx global>{`
