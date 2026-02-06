@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
+import jsQR from "jsqr";
 
 // Interface for BarcodeDetector (Experimental API)
 interface DetectedBarcode {
@@ -47,6 +48,7 @@ export default function ARPage() {
     // --- Refs ---
     const videoRef = useRef<HTMLVideoElement>(null); // The Hologram
     const cameraRef = useRef<HTMLVideoElement>(null); // The Camera Feed
+    const canvasRef = useRef<HTMLCanvasElement>(null); // For jsQR fallback
     const hologramContainerRef = useRef<HTMLDivElement>(null);
     const trackingLoopRef = useRef<number>();
     const isDetectingRef = useRef(false); // Semaphore to prevent async stacking
@@ -112,70 +114,92 @@ export default function ARPage() {
         const detectQR = async () => {
             if (!cameraRef.current || isDetectingRef.current || cameraRef.current.readyState < 2) return;
 
-            // Native BarcodeDetector Check
-            if (!("BarcodeDetector" in window)) {
-                // If explicit fallback logic for jsQR was allowed/installed we'd put it here
-                // For now, if no native support, we might fail silently or show error
-                // console.warn("BarcodeDetector not supported");
-                return;
-            }
+            isDetectingRef.current = true;
 
             try {
-                isDetectingRef.current = true;
-                const barcodeDetector = new BarcodeDetector({ formats: ["qr_code"] });
-                const barcodes = await barcodeDetector.detect(cameraRef.current);
+                // Shared vars for result processing
+                let detected: { x: number, y: number, width: number, height: number } | null = null;
+                const video = cameraRef.current;
+                const { videoWidth, videoHeight, clientWidth, clientHeight } = video;
 
-                // Filter for matching URL/ID if needed, or just take the first one
-                // Ideally we check if the content matches our current ID URL, but for generic demo:
-                const match = barcodes[0]; // Just grab the first QR
+                // 1. Native BarcodeDetector
+                if ("BarcodeDetector" in window) {
+                    const barcodeDetector = new BarcodeDetector({ formats: ["qr_code"] });
+                    const barcodes = await barcodeDetector.detect(video);
+                    if (barcodes.length > 0) {
+                        detected = barcodes[0].boundingBox;
+                    }
+                }
+                // 2. jsQR Fallback (iOS Safari logic)
+                else {
+                    const canvas = canvasRef.current;
+                    if (canvas) {
+                        // Match canvas size to video frame for accurate pixel reading
+                        if (canvas.width !== videoWidth) canvas.width = videoWidth;
+                        if (canvas.height !== videoHeight) canvas.height = videoHeight;
 
-                if (match) {
-                    // Determine Screen Coordinates from Video Coordinates
-                    const video = cameraRef.current;
-                    const { videoWidth, videoHeight, clientWidth, clientHeight } = video;
+                        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+                        if (ctx) {
+                            ctx.drawImage(video, 0, 0, videoWidth, videoHeight);
+                            const imageData = ctx.getImageData(0, 0, videoWidth, videoHeight);
+                            const code = jsQR(imageData.data, videoWidth, videoHeight);
 
-                    if (videoWidth && videoHeight) {
-                        // Calculate 'object-fit: cover' cropping
-                        const videoAspect = videoWidth / videoHeight;
-                        const screenAspect = clientWidth / clientHeight;
+                            if (code) {
+                                // Convert jsQR corners to a bounding box
+                                const minX = Math.min(code.location.topLeftCorner.x, code.location.bottomLeftCorner.x);
+                                const maxX = Math.max(code.location.topRightCorner.x, code.location.bottomRightCorner.x);
+                                const minY = Math.min(code.location.topLeftCorner.y, code.location.topRightCorner.y);
+                                const maxY = Math.max(code.location.bottomLeftCorner.y, code.location.bottomRightCorner.y);
 
-                        let scale, offsetX, offsetY;
-
-                        if (screenAspect > videoAspect) {
-                            // Screen is wider than video (crop top/bottom)
-                            scale = clientWidth / videoWidth;
-                            offsetX = 0;
-                            offsetY = (clientHeight - videoHeight * scale) / 2;
-                        } else {
-                            // Screen is taller than video (crop sides)
-                            scale = clientHeight / videoHeight;
-                            offsetX = (clientWidth - videoWidth * scale) / 2;
-                            offsetY = 0;
+                                detected = {
+                                    x: minX,
+                                    y: minY,
+                                    width: maxX - minX,
+                                    height: maxY - minY
+                                };
+                            }
                         }
+                    }
+                }
 
-                        const { x, y, width, height } = match.boundingBox;
+                // 3. Unified Coordinate Mapping (Video Space -> Screen Space)
+                if (detected && videoWidth && videoHeight) {
+                    // Calculate 'object-fit: cover' cropping
+                    const videoAspect = videoWidth / videoHeight;
+                    const screenAspect = clientWidth / clientHeight;
 
-                        const screenX = x * scale + offsetX;
-                        const screenY = y * scale + offsetY;
-                        const screenW = width * scale;
-                        const screenH = height * scale;
+                    let scale, offsetX, offsetY;
 
-                        // Update State
-                        setQrAnchor({
-                            x: screenX,
-                            y: screenY,
-                            width: screenW,
-                            height: screenH
-                        });
+                    if (screenAspect > videoAspect) {
+                        // Screen is wider than video (crop top/bottom)
+                        scale = clientWidth / videoWidth;
+                        offsetX = 0;
+                        offsetY = (clientHeight - videoHeight * scale) / 2;
+                    } else {
+                        // Screen is taller than video (crop sides)
+                        scale = clientHeight / videoHeight;
+                        offsetX = (clientWidth - videoWidth * scale) / 2;
+                        offsetY = 0;
+                    }
 
-                        // Ensure video is playing
-                        if (videoRef.current && videoRef.current.paused) {
-                            videoRef.current.play().catch(e => console.log("Play error", e));
-                        }
+                    const screenX = detected.x * scale + offsetX;
+                    const screenY = detected.y * scale + offsetY;
+                    const screenW = detected.width * scale;
+                    const screenH = detected.height * scale;
+
+                    setQrAnchor({
+                        x: screenX,
+                        y: screenY,
+                        width: screenW,
+                        height: screenH
+                    });
+
+                    // Ensure video is playing
+                    if (videoRef.current && videoRef.current.paused) {
+                        videoRef.current.play().catch(e => console.log("Play error", e));
                     }
                 } else {
                     // Lost tracking
-                    // You might add a debounce or "patience" here to prevent flickering
                     setQrAnchor(null);
                     if (videoRef.current) {
                         videoRef.current.pause();
@@ -285,6 +309,9 @@ export default function ARPage() {
                 className="absolute inset-0 w-full h-full object-cover"
                 style={{ zIndex: 1 }}
             />
+
+            {/* Hidden Canvas for jsQR Fallback */}
+            <canvas ref={canvasRef} className="hidden" />
 
             {/* 2. UI: Close Button */}
             <button
