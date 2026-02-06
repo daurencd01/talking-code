@@ -29,11 +29,11 @@ export default function ARPage() {
 
     // --- Data State ---
     const [videoSrc, setVideoSrc] = useState<string | null>(null);
+    const [maskSrc, setMaskSrc] = useState<string | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [loadingVideo, setLoadingVideo] = useState(true);
 
     // --- AR State ---
-    // null = search mode, Rect = tracking mode
     const [qrAnchor, setQrAnchor] = useState<{
         x: number;
         y: number;
@@ -194,12 +194,10 @@ export default function ARPage() {
                         width: screenW,
                         height: screenH
                     });
-
-                    // Autoplay REMOVED. Activation is manual now.
                 } else {
                     // Lost tracking
                     setQrAnchor(null);
-                    setActivated(false); // Reset activation state
+                    setActivated(false);
                     if (videoRef.current) {
                         videoRef.current.pause();
                         videoRef.current.currentTime = 0;
@@ -213,13 +211,11 @@ export default function ARPage() {
             }
         };
 
-        // Run detection ~15-20 times a second is enough for UI updates
         trackingInterval = setInterval(detectQR, 100);
-
         return () => clearInterval(trackingInterval);
-    }, [params]); // Re-init if params change, but largely static
+    }, [params]);
 
-    // 4. Initial Setup
+    // 4. Initial Setup (Fetch Data & Start Camera)
     useEffect(() => {
         // Orientation Listeners
         if (typeof window !== "undefined") {
@@ -227,15 +223,32 @@ export default function ARPage() {
             window.addEventListener("resize", () => setIsPortrait(window.matchMedia("(orientation: portrait)").matches));
         }
 
-        // Initialize Video & Camera
+        // Initialize
         const init = async () => {
-            // 1. Fetch Hologram
             const id = params?.id as string;
             if (id) {
                 const { data } = await supabase.from("talking_codes").select("*").eq("id", id).single();
                 if (data?.video_path) {
+                    // A. Video
                     const { data: urlData } = supabase.storage.from("videos").getPublicUrl(data.video_path);
                     setVideoSrc(urlData.publicUrl);
+
+                    // B. Mask (Check Existence)
+                    const maskPath = `videos/${id}_mask.png`;
+                    const { data: maskUrlData } = supabase.storage.from("videos").getPublicUrl(maskPath);
+                    const maskUrl = maskUrlData.publicUrl;
+
+                    // Verify existance via Image load
+                    const img = new Image();
+                    img.src = maskUrl;
+                    img.onload = () => {
+                        console.log("Hologram Mask Loaded");
+                        setMaskSrc(maskUrl);
+                    };
+                    img.onerror = () => {
+                        console.log("No mask found, using standard video");
+                    };
+
                     setLoadingVideo(false);
                 } else {
                     setError("Not Found");
@@ -243,7 +256,6 @@ export default function ARPage() {
                 }
             }
 
-            // 2. Start Camera
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({
                     video: { facingMode: "environment" },
@@ -257,7 +269,7 @@ export default function ARPage() {
 
         init();
 
-        // Start Visual Loop
+        // Start Loop
         trackingLoopRef.current = requestAnimationFrame(renderLoop);
 
         // Permission Dance (iOS)
@@ -290,7 +302,6 @@ export default function ARPage() {
         setActivated(true);
     };
 
-    // Trigger play when activated
     useEffect(() => {
         if (activated && videoRef.current) {
             videoRef.current.play().catch(e => console.log("Play error", e));
@@ -303,7 +314,6 @@ export default function ARPage() {
         return <div className="fixed inset-0 bg-black text-white p-4 flex items-center justify-center">Camera Error</div>;
     }
 
-    // Portrait Enforcement
     if (!isPortrait) {
         return <div className="fixed inset-0 bg-black flex items-center justify-center text-white">Please use Portrait Mode</div>;
     }
@@ -321,7 +331,6 @@ export default function ARPage() {
                 style={{ zIndex: 1 }}
             />
 
-            {/* Hidden Canvas for jsQR Fallback */}
             <canvas ref={canvasRef} className="hidden" />
 
             {/* 2. UI: Close Button */}
@@ -335,7 +344,7 @@ export default function ARPage() {
             {/* 3. States Container */}
             <div className="absolute inset-0 z-20 pointer-events-none" style={{ perspective: '1000px' }}>
 
-                {/* SEARCH MODE: Reticle + Prompt */}
+                {/* SEARCH MODE */}
                 {!qrAnchor && (
                     <div className="absolute inset-0 flex flex-col items-center justify-center animate-fade-in">
                         <div className="w-64 h-64 border-2 border-dashed border-white/50 rounded-xl relative flex items-center justify-center">
@@ -351,29 +360,24 @@ export default function ARPage() {
                     </div>
                 )}
 
-                {/* TRACKING MODE: Hologram anchored to QR */}
+                {/* TRACKING MODE */}
                 {qrAnchor && videoSrc && (
                     <div
                         ref={hologramContainerRef}
                         className="absolute origin-bottom transition-all duration-100 ease-out"
                         style={{
-                            // Position exactly at the QR box
                             left: `${qrAnchor.x}px`,
                             top: `${qrAnchor.y}px`,
                             width: `${qrAnchor.width}px`,
                             height: `${qrAnchor.height}px`,
                         }}
                     >
-                        {/* 1. ACTIVATED: Show Hologram */}
                         {activated && (
                             <div
                                 className="absolute bottom-full left-1/2 -translate-x-1/2 w-[180%] h-[150%] flex flex-col items-center justify-end"
                                 style={{ marginBottom: '10px' }}
                             >
-                                {/* Materialization Container */}
                                 <div className="relative w-full h-full hologram-materialize origin-bottom">
-
-                                    {/* Glow/Scanlines */}
                                     <div className="absolute inset-0 scanlines z-20 rounded-lg opacity-60" />
                                     <div className="absolute inset-0 bg-cyan-500/10 z-10 blur-xl rounded-full opacity-30" />
 
@@ -386,15 +390,20 @@ export default function ARPage() {
                                         muted
                                         className="w-full h-full object-contain filter drop-shadow-[0_0_15px_rgba(0,190,255,0.5)]"
                                         style={{
-                                            maskImage: 'linear-gradient(to bottom, black 85%, transparent 100%)',
-                                            WebkitMaskImage: 'linear-gradient(to bottom, black 85%, transparent 100%)'
+                                            maskImage: maskSrc ? `url(${maskSrc})` : 'linear-gradient(to bottom, black 85%, transparent 100%)',
+                                            WebkitMaskImage: maskSrc ? `url(${maskSrc})` : 'linear-gradient(to bottom, black 85%, transparent 100%)',
+                                            maskSize: 'contain',
+                                            WebkitMaskSize: 'contain',
+                                            maskRepeat: 'no-repeat',
+                                            WebkitMaskRepeat: 'no-repeat',
+                                            maskPosition: 'center',
+                                            WebkitMaskPosition: 'center'
                                         }}
                                     />
                                 </div>
                             </div>
                         )}
 
-                        {/* 2. PRE-ACTIVATION: Tap Button */}
                         {!activated && (
                             <div className="absolute bottom-full mb-4 left-1/2 -translate-x-1/2 min-w-[150px] flex justify-center">
                                 <button
@@ -406,7 +415,6 @@ export default function ARPage() {
                             </div>
                         )}
 
-                        {/* Tracking Confirmation (The green box around QR) */}
                         <div className="absolute inset-0 border-2 border-cyan-400/50 rounded-lg animate-pulse bg-cyan-400/10 box-confirm" />
                     </div>
                 )}

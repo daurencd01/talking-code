@@ -10,6 +10,7 @@ export default function CreatePage() {
     const [timeLeft, setTimeLeft] = useState(15);
     const [isPreparing, setIsPreparing] = useState(false);
     const [isProcessing, setIsProcessing] = useState(false);
+    const [processingStep, setProcessingStep] = useState<string>("");
     const [hasUploaded, setHasUploaded] = useState(false);
 
     const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -31,9 +32,55 @@ export default function CreatePage() {
         }
     }, []);
 
+    // --- Helper: Convert Base64 to Blob ---
+    const base64ToBlob = (base64: string): Promise<Blob> => {
+        return fetch(base64).then(res => res.blob());
+    };
+
+    // --- Helper: Extract Frame from Video Blob ---
+    const extractFirstFrame = async (videoBlob: Blob): Promise<Blob | null> => {
+        return new Promise((resolve) => {
+            const video = document.createElement("video");
+            video.preload = "metadata";
+            video.muted = true;
+            video.playsInline = true;
+
+            const url = URL.createObjectURL(videoBlob);
+            video.src = url;
+
+            video.onloadeddata = () => {
+                video.currentTime = 0.5; // Capture slightly in to avoid black start frames
+            };
+
+            video.onseeked = () => {
+                const canvas = document.createElement("canvas");
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                const ctx = canvas.getContext("2d");
+                if (ctx) {
+                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                    canvas.toBlob((blob) => {
+                        URL.revokeObjectURL(url);
+                        resolve(blob);
+                    }, "image/png");
+                } else {
+                    URL.revokeObjectURL(url);
+                    resolve(null);
+                }
+            };
+
+            video.onerror = () => {
+                URL.revokeObjectURL(url);
+                resolve(null);
+            };
+        });
+    };
+
     // --- Shared Upload Logic ---
     const processAndUploadVideo = async (blob: Blob, extension: string = 'webm') => {
         setIsProcessing(true);
+        setProcessingStep("Uploading video...");
+
         try {
             const id = crypto.randomUUID();
             const fileName = `${id}.${extension}`;
@@ -42,8 +89,7 @@ export default function CreatePage() {
             // Calculate expiration: 24 hours from now
             const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
 
-            // 1. Upload to Supabase Storage
-            console.log("Uploading to Storage...");
+            // 1. Upload Video to Supabase Storage
             const { error: uploadError } = await supabase.storage
                 .from('videos')
                 .upload(filePath, blob);
@@ -52,8 +98,53 @@ export default function CreatePage() {
                 throw new Error(`Storage upload failed: ${uploadError.message}`);
             }
 
-            // 2. Insert into Database with expires_at
-            console.log("Inserting into Database...");
+            // 2. Background Removal Pipeline
+            setProcessingStep("Generating hologram mask...");
+            try {
+                // a. Extract Frame
+                const frameBlob = await extractFirstFrame(blob);
+                if (frameBlob) {
+                    // b. Upload Frame to get URL
+                    const framePath = `videos/${id}_frame.png`;
+                    const { error: frameUploadError } = await supabase.storage
+                        .from('videos')
+                        .upload(framePath, frameBlob);
+
+                    if (!frameUploadError) {
+                        const { data: frameUrlData } = supabase.storage
+                            .from('videos')
+                            .getPublicUrl(framePath);
+
+                        // c. Call Server API
+                        const response = await fetch("/api/remove-background", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ imageUrl: frameUrlData.publicUrl })
+                        });
+
+                        if (response.ok) {
+                            const result = await response.json();
+                            if (result.image) {
+                                // d. Upload Mask
+                                const maskBlob = await base64ToBlob(result.image);
+                                const maskPath = `videos/${id}_mask.png`;
+                                await supabase.storage
+                                    .from('videos')
+                                    .upload(maskPath, maskBlob);
+                                console.log("Mask uploaded successfully");
+                            }
+                        } else {
+                            console.warn("Background removal failed, skipping mask generation");
+                        }
+                    }
+                }
+            } catch (bgError) {
+                console.error("Background removal error (non-fatal):", bgError);
+                // Continue flow even if BG removal fails
+            }
+
+            // 3. Insert into Database
+            setProcessingStep("Finalizing...");
             const { error: dbError } = await supabase
                 .from('talking_codes')
                 .insert({
@@ -68,10 +159,8 @@ export default function CreatePage() {
                 throw new Error(`Database insert failed: ${dbError.message}`);
             }
 
-            // 3. Mark session as "uploaded"
+            // 4. Mark session and Redirect
             sessionStorage.setItem("has_uploaded_talking_code", "true");
-
-            // 4. Redirect on Success
             router.push(`/view/${id}`);
 
         } catch (err: any) {
@@ -156,36 +245,29 @@ export default function CreatePage() {
         const file = e.target.files?.[0];
         if (!file) return;
 
-        // Reset input value so same file can be selected again if needed (though we redirect usually)
         e.target.value = "";
 
-        // 1. Validate Type
         const validTypes = ['video/mp4', 'video/webm'];
         if (!validTypes.includes(file.type)) {
             alert('Invalid format. Only MP4 and WebM are allowed.');
             return;
         }
 
-        // 2. Validate Size (Max 30MB)
         if (file.size > 30 * 1024 * 1024) {
             alert('File too large. Max 30MB allowed.');
             return;
         }
 
-        // 3. Validate Duration
         const video = document.createElement('video');
         video.preload = 'metadata';
 
         video.onloadedmetadata = () => {
             window.URL.revokeObjectURL(video.src);
-            // Allow slight buffer (e.g., 15.5s) or strict 15
             if (video.duration > 15.5) {
                 alert(`Video is too long (${Math.round(video.duration)}s). Max 15 seconds.`);
                 return;
             }
 
-            // Valid -> Proceed to Upload
-            // Infer extension from type
             const ext = file.type.includes('mp4') ? 'mp4' : 'webm';
             processAndUploadVideo(file, ext);
         };
@@ -238,6 +320,9 @@ export default function CreatePage() {
                         Create Your Code
                     </h1>
                     <p className="mt-2 text-gray-400">Record or upload (max 15s)</p>
+                    <p className="text-xs text-blue-400 mt-1">
+                        ✨ AI background removal (beta) — use clear lighting
+                    </p>
                 </div>
 
                 <div className="relative aspect-video bg-gray-900 rounded-2xl overflow-hidden shadow-2xl ring-1 ring-gray-800">
@@ -256,10 +341,10 @@ export default function CreatePage() {
                     )}
 
                     {isProcessing && (
-                        <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/60 backdrop-blur-sm z-10">
-                            <div className="w-10 h-10 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mb-2"></div>
-                            <span className="text-white text-sm font-medium">
-                                Uploading...
+                        <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 backdrop-blur-md z-10 transition-all duration-300">
+                            <div className="w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mb-4"></div>
+                            <span className="text-white text-lg font-bold animate-pulse">
+                                {processingStep || "Processing..."}
                             </span>
                         </div>
                     )}
