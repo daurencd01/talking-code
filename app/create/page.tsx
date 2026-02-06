@@ -17,6 +17,7 @@ export default function CreatePage() {
     const streamRef = useRef<MediaStream | null>(null);
     const chunksRef = useRef<Blob[]>([]);
     const timerRef = useRef<NodeJS.Timeout | null>(null);
+    const fileInputRef = useRef<HTMLInputElement>(null);
 
     const MAX_DURATION = 15;
 
@@ -30,21 +31,57 @@ export default function CreatePage() {
         }
     }, []);
 
-    const stopRecording = useCallback(() => {
-        if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
-            mediaRecorderRef.current.stop();
-        }
-        if (streamRef.current) {
-            streamRef.current.getTracks().forEach((track) => track.stop());
-            streamRef.current = null;
-        }
-        if (timerRef.current) {
-            clearInterval(timerRef.current);
-            timerRef.current = null;
-        }
-        setIsRecording(false);
-    }, []);
+    // --- Shared Upload Logic ---
+    const processAndUploadVideo = async (blob: Blob, extension: string = 'webm') => {
+        setIsProcessing(true);
+        try {
+            const id = crypto.randomUUID();
+            const fileName = `${id}.${extension}`;
+            const filePath = `videos/${fileName}`;
 
+            // Calculate expiration: 24 hours from now
+            const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+
+            // 1. Upload to Supabase Storage
+            console.log("Uploading to Storage...");
+            const { error: uploadError } = await supabase.storage
+                .from('videos')
+                .upload(filePath, blob);
+
+            if (uploadError) {
+                throw new Error(`Storage upload failed: ${uploadError.message}`);
+            }
+
+            // 2. Insert into Database with expires_at
+            console.log("Inserting into Database...");
+            const { error: dbError } = await supabase
+                .from('talking_codes')
+                .insert({
+                    id: id,
+                    video_path: filePath,
+                    expires_at: expiresAt
+                });
+
+            if (dbError) {
+                // Cleanup storage if DB insert fails
+                await supabase.storage.from('videos').remove([filePath]);
+                throw new Error(`Database insert failed: ${dbError.message}`);
+            }
+
+            // 3. Mark session as "uploaded"
+            sessionStorage.setItem("has_uploaded_talking_code", "true");
+
+            // 4. Redirect on Success
+            router.push(`/view/${id}`);
+
+        } catch (err: any) {
+            console.error("Processing error:", err);
+            alert(`Error: ${err.message || "Unknown error occurred"}`);
+            setIsProcessing(false);
+        }
+    };
+
+    // --- Recording Logic ---
     const startRecording = async () => {
         if (hasUploaded) return;
 
@@ -73,54 +110,9 @@ export default function CreatePage() {
                 }
             };
 
-            recorder.onstop = async () => {
-                setIsProcessing(true);
-                try {
-                    const blob = new Blob(chunksRef.current, { type: "video/webm" });
-                    const id = crypto.randomUUID();
-                    const fileName = `${id}.webm`;
-                    const filePath = `videos/${fileName}`;
-
-                    // Calculate expiration: 24 hours from now
-                    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-
-                    // 1. Upload to Supabase Storage
-                    console.log("Uploading to Storage...");
-                    const { error: uploadError } = await supabase.storage
-                        .from('videos')
-                        .upload(filePath, blob);
-
-                    if (uploadError) {
-                        throw new Error(`Storage upload failed: ${uploadError.message}`);
-                    }
-
-                    // 2. Insert into Database with expires_at
-                    console.log("Inserting into Database...");
-                    const { error: dbError } = await supabase
-                        .from('talking_codes')
-                        .insert({
-                            id: id,
-                            video_path: filePath,
-                            expires_at: expiresAt
-                        });
-
-                    if (dbError) {
-                        // Optional: Cleanup storage if DB insert fails
-                        await supabase.storage.from('videos').remove([filePath]);
-                        throw new Error(`Database insert failed: ${dbError.message}`);
-                    }
-
-                    // 3. Mark session as "uploaded"
-                    sessionStorage.setItem("has_uploaded_talking_code", "true");
-
-                    // 4. Redirect on Success
-                    router.push(`/view/${id}`);
-
-                } catch (err: any) {
-                    console.error("Processing error:", err);
-                    alert(`Error: ${err.message || "Unknown error occurred"}`);
-                    setIsProcessing(false);
-                }
+            recorder.onstop = () => {
+                const blob = new Blob(chunksRef.current, { type: "video/webm" });
+                processAndUploadVideo(blob, 'webm');
             };
 
             recorder.start();
@@ -144,6 +136,73 @@ export default function CreatePage() {
         }
     };
 
+    const stopRecording = useCallback(() => {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
+            mediaRecorderRef.current.stop();
+        }
+        if (streamRef.current) {
+            streamRef.current.getTracks().forEach((track) => track.stop());
+            streamRef.current = null;
+        }
+        if (timerRef.current) {
+            clearInterval(timerRef.current);
+            timerRef.current = null;
+        }
+        setIsRecording(false);
+    }, []);
+
+    // --- Upload Logic ---
+    const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+
+        // Reset input value so same file can be selected again if needed (though we redirect usually)
+        e.target.value = "";
+
+        // 1. Validate Type
+        const validTypes = ['video/mp4', 'video/webm'];
+        if (!validTypes.includes(file.type)) {
+            alert('Invalid format. Only MP4 and WebM are allowed.');
+            return;
+        }
+
+        // 2. Validate Size (Max 30MB)
+        if (file.size > 30 * 1024 * 1024) {
+            alert('File too large. Max 30MB allowed.');
+            return;
+        }
+
+        // 3. Validate Duration
+        const video = document.createElement('video');
+        video.preload = 'metadata';
+
+        video.onloadedmetadata = () => {
+            window.URL.revokeObjectURL(video.src);
+            // Allow slight buffer (e.g., 15.5s) or strict 15
+            if (video.duration > 15.5) {
+                alert(`Video is too long (${Math.round(video.duration)}s). Max 15 seconds.`);
+                return;
+            }
+
+            // Valid -> Proceed to Upload
+            // Infer extension from type
+            const ext = file.type.includes('mp4') ? 'mp4' : 'webm';
+            processAndUploadVideo(file, ext);
+        };
+
+        video.onerror = () => {
+            window.URL.revokeObjectURL(video.src);
+            alert('Failed to load video metadata. The file might be corrupted.');
+        };
+
+        video.src = URL.createObjectURL(file);
+    };
+
+    const triggerFileUpload = () => {
+        fileInputRef.current?.click();
+    };
+
+    // --- Cleanup ---
     useEffect(() => {
         return () => {
             if (timerRef.current) clearInterval(timerRef.current);
@@ -176,9 +235,9 @@ export default function CreatePage() {
             <div className="max-w-md w-full space-y-8">
                 <div className="text-center">
                     <h1 className="text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-600">
-                        Record Your Update
+                        Create Your Code
                     </h1>
-                    <p className="mt-2 text-gray-400">max 15 seconds</p>
+                    <p className="mt-2 text-gray-400">Record or upload (max 15s)</p>
                 </div>
 
                 <div className="relative aspect-video bg-gray-900 rounded-2xl overflow-hidden shadow-2xl ring-1 ring-gray-800">
@@ -213,20 +272,44 @@ export default function CreatePage() {
                     )}
                 </div>
 
-                <div className="flex justify-center gap-4">
+                <div className="flex flex-col items-center gap-4">
+                    {/* Recording Controls */}
                     {!isRecording ? (
-                        <button
-                            onClick={startRecording}
-                            disabled={isPreparing || isProcessing}
-                            className="group relative inline-flex items-center justify-center px-8 py-3 text-base font-medium text-white bg-blue-600 rounded-full hover:bg-blue-700 transition-all duration-200 shadow-lg shadow-blue-600/30 disabled:opacity-50 disabled:cursor-not-allowed hover:scale-105 active:scale-95"
-                        >
-                            {isPreparing ? "Initializing..." : "Start Recording"}
-                            <div className="absolute inset-0 rounded-full ring-2 ring-white/20 group-hover:ring-white/40 transition-all" />
-                        </button>
+                        <div className="flex flex-col w-full gap-4">
+                            <button
+                                onClick={startRecording}
+                                disabled={isPreparing || isProcessing}
+                                className="w-full group relative inline-flex items-center justify-center px-8 py-3 text-base font-medium text-white bg-blue-600 rounded-full hover:bg-blue-700 transition-all duration-200 shadow-lg shadow-blue-600/30 disabled:opacity-50 disabled:cursor-not-allowed hover:scale-105 active:scale-95"
+                            >
+                                {isPreparing ? "Initializing..." : "Start Recording"}
+                                <div className="absolute inset-0 rounded-full ring-2 ring-white/20 group-hover:ring-white/40 transition-all" />
+                            </button>
+
+                            <div className="flex items-center gap-2 text-gray-500 text-sm">
+                                <div className="h-px bg-gray-800 flex-1" />
+                                <span>OR</span>
+                                <div className="h-px bg-gray-800 flex-1" />
+                            </div>
+
+                            <button
+                                onClick={triggerFileUpload}
+                                disabled={isProcessing}
+                                className="w-full group relative inline-flex items-center justify-center px-8 py-3 text-base font-medium text-gray-300 bg-gray-800 rounded-full hover:bg-gray-700 transition-all duration-200 border border-gray-700 hover:border-gray-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                                📥 Upload Video (mp4/webm)
+                            </button>
+                            <input
+                                ref={fileInputRef}
+                                type="file"
+                                accept="video/mp4,video/webm"
+                                className="hidden"
+                                onChange={handleFileSelect}
+                            />
+                        </div>
                     ) : (
                         <button
                             onClick={stopRecording}
-                            className="group relative inline-flex items-center justify-center px-8 py-3 text-base font-medium text-white bg-red-600 rounded-full hover:bg-red-700 transition-all duration-200 shadow-lg shadow-red-600/30 hover:scale-105 active:scale-95"
+                            className="w-full group relative inline-flex items-center justify-center px-8 py-3 text-base font-medium text-white bg-red-600 rounded-full hover:bg-red-700 transition-all duration-200 shadow-lg shadow-red-600/30 hover:scale-105 active:scale-95"
                         >
                             Stop Recording
                             <div className="absolute inset-0 rounded-full ring-2 ring-white/20 group-hover:ring-white/40 transition-all" />
